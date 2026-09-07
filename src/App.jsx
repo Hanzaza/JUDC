@@ -10,7 +10,8 @@ import {
   CheckCircle2, 
   BarChart2, 
   Layers,
-  Sparkles
+  Sparkles,
+  Check
 } from 'lucide-react';
 import confetti from 'canvas-confetti';
 
@@ -28,6 +29,7 @@ import { TrafficLightController as LightControllerWidget } from './components/si
 import { VisionCameraFeed } from './components/vision/VisionCameraFeed';
 import { SupabaseConfigModal } from './components/database/SupabaseConfigModal';
 import { SqlViewerModal } from './components/database/SqlViewerModal';
+import { AdminPanel } from './components/admin/AdminPanel';
 
 import { trafficService } from './services/trafficService';
 import { getStoredCredentials } from './services/supabaseClient';
@@ -38,7 +40,10 @@ export function App() {
   const trafficLightEngine = useMemo(() => new TrafficLightController(), []);
   const visionEngine = useMemo(() => new VisionProcessor(), []);
 
-  // 2. React State
+  // 2. React Navigation & Global State
+  const [currentView, setCurrentView] = useState('OPERATIONS'); // 'OPERATIONS' | 'ADMIN'
+  const [toastNotice, setToastNotice] = useState(null);
+
   const [intersections, setIntersections] = useState([]);
   const [currentIntersection, setCurrentIntersection] = useState(null);
   const [isSupabaseConnected, setIsSupabaseConnected] = useState(false);
@@ -60,22 +65,40 @@ export function App() {
     congestionIndex: 0.32
   });
 
+  const showToast = useCallback((message) => {
+    setToastNotice(message);
+    setTimeout(() => {
+      setToastNotice(null);
+    }, 4000);
+  }, []);
+
+  const loadData = useCallback(async () => {
+    const list = await trafficService.getIntersections();
+    setIntersections(list);
+    if (list.length > 0) {
+      setCurrentIntersection(prev => {
+        if (!prev) return list[0];
+        const stillExists = list.find(i => i.id === prev.id);
+        return stillExists || list[0];
+      });
+    }
+
+    const incs = await trafficService.getIncidents();
+    setIncidents(incs);
+  }, []);
+
   // 3. Load initial data and intersections
   useEffect(() => {
     const creds = getStoredCredentials();
     setIsSupabaseConnected(creds.isConfigured);
+    loadData();
+  }, [loadData]);
 
-    const initData = async () => {
-      const list = await trafficService.getIntersections();
-      setIntersections(list);
-      if (list.length > 0) setCurrentIntersection(list[0]);
-
-      const incs = await trafficService.getIncidents();
-      setIncidents(incs);
-    };
-
-    initData();
-  }, []);
+  const handleConnectionChanged = async (isConnected) => {
+    setIsSupabaseConnected(isConnected);
+    await loadData();
+    showToast(isConnected ? 'Conectado con éxito a Supabase PostgreSQL.' : 'Cambiado a modo Almacén Local.');
+  };
 
   // 4. Telemetry Tick handler from the Canvas Simulator loop
   const handleTelemetryTick = useCallback(async (telemetry) => {
@@ -146,13 +169,15 @@ export function App() {
   // 5. Emergency priority handler
   const handleEmergencyDetected = useCallback(async (approach) => {
     const newIncident = {
+      intersection_id: currentIntersection?.id,
       incident_type: 'EMERGENCY_CORRIDOR',
       severity: 'CRITICAL',
-      description: `Vehículo de emergencia detectado en acceso ${approach}. Activación instantánea de corredor verde prioritario.`
+      description: `Vehículo de emergencia detectado en acceso ${approach}. Activación instantánea de onda verde prioritaria.`
     };
-    const saved = await trafficService.logIncident(newIncident);
+    const saved = await trafficService.createIncident(newIncident);
     setIncidents(prev => [saved, ...prev.slice(0, 15)]);
-  }, []);
+    showToast('Alerta de emergencia: Corredor verde prioritario activado.');
+  }, [currentIntersection, showToast]);
 
   const triggerManualEmergency = () => {
     simEngine.injectEmergencyVehicle('NORTH', 'EMERGENCY_AMBULANCE');
@@ -164,7 +189,9 @@ export function App() {
   const handleModeChange = (newMode) => {
     trafficLightEngine.setMode(newMode);
     if (currentIntersection) {
+      trafficService.updateIntersection(currentIntersection.id, { control_mode: newMode });
       setCurrentIntersection(prev => ({ ...prev, control_mode: newMode }));
+      setIntersections(prev => prev.map(i => i.id === currentIntersection.id ? { ...i, control_mode: newMode } : i));
     }
   };
 
@@ -185,117 +212,147 @@ export function App() {
         onOpenSupabaseModal={() => setIsSupabaseModalOpen(true)}
         onOpenSqlModal={() => setIsSqlModalOpen(true)}
         onTriggerEmergency={triggerManualEmergency}
+        currentView={currentView}
+        onViewChange={setCurrentView}
       />
 
-      {/* Main Content Dashboard */}
+      {/* Floating Notice Toast */}
+      {toastNotice && (
+        <div className="fixed top-18 right-6 z-50 animate-bounce">
+          <div className="flex items-center gap-2.5 px-4 py-2.5 rounded-xl bg-cyan-950/90 border border-cyan-500/50 text-cyan-200 text-xs font-semibold shadow-2xl backdrop-blur-md">
+            <Check className="w-4 h-4 text-cyan-400" />
+            <span>{toastNotice}</span>
+          </div>
+        </div>
+      )}
+
+      {/* Main Content View */}
       <main className="flex-1 max-w-7xl w-full mx-auto p-4 lg:p-6 space-y-6">
         
-        {/* KPI Metrics Row */}
-        <section className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3.5">
-          <MetricCard
-            title="Vehículos en Red"
-            value={kpis.activeVehicles}
-            unit="veh"
-            changeText="En monitoreo"
-            isPositiveChange={true}
-            icon={Car}
-            accentColor="cyan"
-            sublabel="Visión Óptica Activa"
+        {currentView === 'OPERATIONS' ? (
+          <>
+            {/* KPI Metrics Row */}
+            <section className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3.5">
+              <MetricCard
+                title="Vehículos en Red"
+                value={kpis.activeVehicles}
+                unit="veh"
+                changeText="En monitoreo"
+                isPositiveChange={true}
+                icon={Car}
+                accentColor="cyan"
+                sublabel="Visión Óptica Activa"
+              />
+
+              <MetricCard
+                title="Demora Evitada"
+                value={kpis.waitTimeSavedSec}
+                unit="seg"
+                changeText="-34.2% vs Tradicional"
+                isPositiveChange={true}
+                icon={Clock}
+                accentColor="violet"
+                sublabel="Ahorro de Tiempo"
+              />
+
+              <MetricCard
+                title="Vehículos Despejados"
+                value={kpis.totalCrossed}
+                unit="total"
+                changeText="+22.8% Flujo"
+                isPositiveChange={true}
+                icon={Activity}
+                accentColor="amber"
+                sublabel="Cruce sin Colisiones"
+              />
+
+              <MetricCard
+                title="Reducción CO₂"
+                value={kpis.co2SavedGrams}
+                unit="g"
+                changeText="Emisiones Evitadas"
+                isPositiveChange={true}
+                icon={Leaf}
+                accentColor="emerald"
+                sublabel="Optimización de Ralentí"
+              />
+
+              <MetricCard
+                title="Nivel de Servicio"
+                value={`LOS ${kpis.levelOfService}`}
+                unit=""
+                changeText={`Índice: ${Math.round(kpis.congestionIndex * 100)}%`}
+                isPositiveChange={kpis.levelOfService <= 'C'}
+                icon={ShieldAlert}
+                accentColor={kpis.levelOfService <= 'C' ? 'cyan' : 'rose'}
+                sublabel="Norma HCM Tráfico"
+              />
+            </section>
+
+            {/* Primary Operational Grid (Simulator + Controls vs Computer Vision + Alerts) */}
+            <section className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+              
+              {/* Left Column: 2D Simulation & Light Controller */}
+              <div className="lg:col-span-7 space-y-6">
+                <IntersectionSimulator
+                  engine={simEngine}
+                  visionProcessor={visionEngine}
+                  trafficController={trafficLightEngine}
+                  onTelemetryTick={handleTelemetryTick}
+                  onEmergencyDetected={handleEmergencyDetected}
+                />
+
+                <LightControllerWidget
+                  trafficController={trafficLightEngine}
+                  currentLightState={currentLightState}
+                  onModeChange={handleModeChange}
+                  onManualAdvance={handleManualAdvance}
+                />
+              </div>
+
+              {/* Right Column: Computer Vision CCTV Monitor & Live Incident Feed */}
+              <div className="lg:col-span-5 space-y-6 flex flex-col justify-between">
+                <VisionCameraFeed
+                  engine={simEngine}
+                  visionProcessor={visionEngine}
+                />
+
+                <LiveIncidentsFeed
+                  incidents={incidents}
+                />
+              </div>
+
+            </section>
+
+            {/* Telemetry Charts & Urban Network Section */}
+            <section className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+              <div className="lg:col-span-8">
+                <TrafficFlowChart historyData={metricsHistory} />
+              </div>
+              <div className="lg:col-span-4">
+                <NetworkMap
+                  intersections={intersections}
+                  currentIntersection={currentIntersection}
+                  onSelect={setCurrentIntersection}
+                />
+              </div>
+            </section>
+          </>
+        ) : (
+          /* Admin Panel View */
+          <AdminPanel
+            intersections={intersections}
+            onIntersectionsChange={setIntersections}
+            incidents={incidents}
+            onIncidentsChange={setIncidents}
+            currentIntersection={currentIntersection}
+            onSelectIntersection={setCurrentIntersection}
+            isSupabaseConnected={isSupabaseConnected}
+            onOpenSupabaseModal={() => setIsSupabaseModalOpen(true)}
+            onOpenSqlModal={() => setIsSqlModalOpen(true)}
+            onShowNotice={showToast}
           />
-
-          <MetricCard
-            title="Demora Evitada"
-            value={kpis.waitTimeSavedSec}
-            unit="seg"
-            changeText="-34.2% vs Tradicional"
-            isPositiveChange={true}
-            icon={Clock}
-            accentColor="violet"
-            sublabel="Ahorro de Tiempo"
-          />
-
-          <MetricCard
-            title="Vehículos Despejados"
-            value={kpis.totalCrossed}
-            unit="total"
-            changeText="+22.8% Flujo"
-            isPositiveChange={true}
-            icon={Activity}
-            accentColor="amber"
-            sublabel="Cruce sin Colisiones"
-          />
-
-          <MetricCard
-            title="Reducción CO₂"
-            value={kpis.co2SavedGrams}
-            unit="g"
-            changeText="Emisiones Evitadas"
-            isPositiveChange={true}
-            icon={Leaf}
-            accentColor="emerald"
-            sublabel="Optimización de Ralentí"
-          />
-
-          <MetricCard
-            title="Nivel de Servicio"
-            value={`LOS ${kpis.levelOfService}`}
-            unit=""
-            changeText={`Índice: ${Math.round(kpis.congestionIndex * 100)}%`}
-            isPositiveChange={kpis.levelOfService <= 'C'}
-            icon={ShieldAlert}
-            accentColor={kpis.levelOfService <= 'C' ? 'cyan' : 'rose'}
-            sublabel="Norma HCM Tráfico"
-          />
-        </section>
-
-        {/* Primary Operational Grid (Simulator + Controls vs Computer Vision + Alerts) */}
-        <section className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-          
-          {/* Left Column: 2D Simulation & Light Controller */}
-          <div className="lg:col-span-7 space-y-6">
-            <IntersectionSimulator
-              engine={simEngine}
-              visionProcessor={visionEngine}
-              trafficController={trafficLightEngine}
-              onTelemetryTick={handleTelemetryTick}
-              onEmergencyDetected={handleEmergencyDetected}
-            />
-
-            <LightControllerWidget
-              trafficController={trafficLightEngine}
-              currentLightState={currentLightState}
-              onModeChange={handleModeChange}
-              onManualAdvance={handleManualAdvance}
-            />
-          </div>
-
-          {/* Right Column: Computer Vision CCTV Monitor & Live Incident Feed */}
-          <div className="lg:col-span-5 space-y-6 flex flex-col justify-between">
-            <VisionCameraFeed
-              engine={simEngine}
-              visionProcessor={visionEngine}
-            />
-
-            <LiveIncidentsFeed
-              incidents={incidents}
-            />
-          </div>
-
-        </section>
-
-        {/* Telemetry Charts & Urban Network Section */}
-        <section className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-          <div className="lg:col-span-8">
-            <TrafficFlowChart historyData={metricsHistory} />
-          </div>
-          <div className="lg:col-span-4">
-            <NetworkMap
-              intersections={intersections}
-              currentIntersection={currentIntersection}
-              onSelect={setCurrentIntersection}
-            />
-          </div>
-        </section>
+        )}
 
       </main>
 
@@ -303,7 +360,7 @@ export function App() {
       <SupabaseConfigModal
         isOpen={isSupabaseModalOpen}
         onClose={() => setIsSupabaseModalOpen(false)}
-        onConnectionChanged={setIsSupabaseConnected}
+        onConnectionChanged={handleConnectionChanged}
       />
 
       <SqlViewerModal
